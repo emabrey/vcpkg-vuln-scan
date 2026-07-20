@@ -29,7 +29,7 @@ from typing import Iterable
 
 OSV_ENDPOINT = "https://api.osv.dev/v1/query"
 TOOL_NAME = "vcpkg-vuln-scan"
-TOOL_VERSION = "0.4.0"
+TOOL_VERSION = "0.5.0"
 TOOL_URI = "https://github.com/emabrey/vcpkg-vuln-scan"
 
 
@@ -214,6 +214,71 @@ def canonical_id(vuln: dict) -> str:
 
 def is_withdrawn(vuln: dict) -> bool:
     return "withdrawn" in vuln and vuln["withdrawn"]
+
+
+# CPE target_sw values that identify a language runtime, not a native library.
+# When every CPE on a vuln lands in this set, the record is about that
+# language's package with a matching name (e.g. Ruby's zlib gem), not our
+# C library.
+LANGUAGE_TARGET_SW = {
+    "ruby", "python", "node.js", "nodejs", "node_js",
+    "php", "perl", "java", "dotnet", ".net",
+    "rust", "go", "javascript", "typescript",
+    "erlang", "elixir", "swift", "dart",
+}
+
+# OSV ecosystems that only host language-specific packages.
+LANGUAGE_ECOSYSTEMS = {
+    "RubyGems", "PyPI", "npm", "crates.io", "Go",
+    "Packagist", "NuGet", "Maven", "Hex", "Pub",
+    "SwiftURL", "Bitnami",
+}
+
+
+def is_language_specific(vuln: dict) -> bool:
+    """
+    True when every ecosystem hint on the vuln points at a language-runtime
+    package rather than a native library. Prevents Ruby/Python/npm packages
+    that happen to share a name with a C library (zlib, curl, libxml, ...)
+    from showing up as findings against the C library.
+
+    Only returns True when at least one signal was seen; a vuln with no
+    ecosystem or CPE metadata is kept, since we can't rule it out.
+    """
+    saw_signal = False
+
+    for aff in vuln.get("affected", []) or []:
+        pkg = aff.get("package") or {}
+        eco = pkg.get("ecosystem")
+        if eco:
+            saw_signal = True
+            if eco not in LANGUAGE_ECOSYSTEMS:
+                return False
+
+        cpe_sources: list[dict] = []
+        ds = aff.get("database_specific")
+        if isinstance(ds, dict):
+            cpe_sources.append(ds)
+        for r in aff.get("ranges", []) or []:
+            rds = r.get("database_specific")
+            if isinstance(rds, dict):
+                cpe_sources.append(rds)
+
+        for src in cpe_sources:
+            cpe = src.get("cpe")
+            if not cpe:
+                continue
+            saw_signal = True
+            parts = cpe.split(":")
+            if len(parts) < 11:
+                return False  # unparseable, err on keeping
+            target_sw = parts[10].lower()
+            if target_sw in ("*", "-", ""):
+                return False  # unbounded, might apply to us
+            if target_sw not in LANGUAGE_TARGET_SW:
+                return False  # narrows to something else, don't presume
+
+    return saw_signal
 
 
 SEMVER_TUPLE_RE = re.compile(r"^(?:v)?(\d+)(?:\.(\d+))?(?:\.(\d+))?(?:\.(\d+))?")
@@ -467,6 +532,7 @@ def main() -> int:
     total_suppressed = 0
     total_withdrawn = 0
     total_fixed = 0
+    total_other_ecosystem = 0
 
     for name in closure:
         version = port_version(vcpkg_root, name) if vcpkg_root.exists() else None
@@ -508,6 +574,9 @@ def main() -> int:
         for cid, v in unique.items():
             if is_withdrawn(v):
                 total_withdrawn += 1
+                continue
+            if is_language_specific(v):
+                total_other_ecosystem += 1
                 continue
             if likely_fixed(v, version):
                 total_fixed += 1
@@ -555,6 +624,7 @@ def main() -> int:
         f"\nSummary: {total_active} active, "
         f"{total_suppressed} suppressed, "
         f"{total_fixed} likely-fixed, "
+        f"{total_other_ecosystem} other-ecosystem, "
         f"{total_withdrawn} withdrawn "
         f"across {len(closure)} package(s)."
     )
