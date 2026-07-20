@@ -29,7 +29,7 @@ from typing import Iterable
 
 OSV_ENDPOINT = "https://api.osv.dev/v1/query"
 TOOL_NAME = "vcpkg-vuln-scan"
-TOOL_VERSION = "0.3.0"
+TOOL_VERSION = "0.4.0"
 TOOL_URI = "https://github.com/emabrey/vcpkg-vuln-scan"
 
 
@@ -214,6 +214,61 @@ def canonical_id(vuln: dict) -> str:
 
 def is_withdrawn(vuln: dict) -> bool:
     return "withdrawn" in vuln and vuln["withdrawn"]
+
+
+SEMVER_TUPLE_RE = re.compile(r"^(?:v)?(\d+)(?:\.(\d+))?(?:\.(\d+))?(?:\.(\d+))?")
+
+
+def parse_version_tuple(v: str) -> tuple[int, ...] | None:
+    """
+    Best-effort numeric tuple for version comparison. Handles common formats
+    like "1.3.2", "v2.4.0", "3.3.1.1". Returns None if we can't confidently
+    parse (Debian's "1:1.2.12.dfsg-1", RPM epoch strings, date-based versions).
+    """
+    v = normalize_version(v.strip())
+    # Reject epoch-prefixed (Debian) or dfsg-tagged versions; we can't compare those safely.
+    if ":" in v or "dfsg" in v.lower() or "~" in v:
+        return None
+    m = SEMVER_TUPLE_RE.match(v)
+    if not m:
+        return None
+    parts = tuple(int(g) for g in m.groups() if g is not None)
+    return parts if parts else None
+
+
+def likely_fixed(vuln: dict, current_version: str | None) -> bool:
+    """
+    True when at least one 'affected' entry says a fix landed at a version
+    that's <= ours, and no 'introduced' event pushes past our version.
+    Only returns True when we can confidently compare. When in doubt we
+    keep the finding, so this errs toward false positives, not false negatives.
+    """
+    if not current_version:
+        return False
+    ours = parse_version_tuple(current_version)
+    if ours is None:
+        return False
+
+    for aff in vuln.get("affected", []) or []:
+        for r in aff.get("ranges", []) or []:
+            introduced: tuple[int, ...] | None = None
+            fixed: tuple[int, ...] | None = None
+            for ev in r.get("events", []) or []:
+                if "introduced" in ev and ev["introduced"] not in ("0", 0):
+                    parsed = parse_version_tuple(str(ev["introduced"]))
+                    if parsed is not None:
+                        introduced = parsed
+                if "fixed" in ev:
+                    parsed = parse_version_tuple(str(ev["fixed"]))
+                    if parsed is not None:
+                        fixed = parsed
+            if fixed is None:
+                continue
+            if introduced is not None and ours < introduced:
+                continue  # we're before the vulnerable window
+            if ours >= fixed:
+                return True
+    return False
 
 
 def dedupe_vulns(vulns: list[dict]) -> dict[str, dict]:
@@ -411,6 +466,7 @@ def main() -> int:
     total_active = 0
     total_suppressed = 0
     total_withdrawn = 0
+    total_fixed = 0
 
     for name in closure:
         version = port_version(vcpkg_root, name) if vcpkg_root.exists() else None
@@ -452,6 +508,9 @@ def main() -> int:
         for cid, v in unique.items():
             if is_withdrawn(v):
                 total_withdrawn += 1
+                continue
+            if likely_fixed(v, version):
+                total_fixed += 1
                 continue
             reason = suppressions.get(cid)
             if reason is not None:
@@ -495,6 +554,7 @@ def main() -> int:
     print(
         f"\nSummary: {total_active} active, "
         f"{total_suppressed} suppressed, "
+        f"{total_fixed} likely-fixed, "
         f"{total_withdrawn} withdrawn "
         f"across {len(closure)} package(s)."
     )
