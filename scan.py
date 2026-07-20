@@ -283,17 +283,28 @@ def is_language_specific(vuln: dict) -> bool:
 
 SEMVER_TUPLE_RE = re.compile(r"^(?:v)?(\d+)(?:\.(\d+))?(?:\.(\d+))?(?:\.(\d+))?")
 
+# Markers that identify a Debian/Ubuntu package version (as opposed to plain
+# upstream semver). When present, we do a bit of extra unwrapping to get at
+# the upstream version number.
+DEBIAN_MARKER_RE = re.compile(r"^\d+:|dfsg|deb\d|ubuntu|\+ds", re.IGNORECASE)
+
 
 def parse_version_tuple(v: str) -> tuple[int, ...] | None:
     """
-    Best-effort numeric tuple for version comparison. Handles common formats
-    like "1.3.2", "v2.4.0", "3.3.1.1". Returns None if we can't confidently
-    parse (Debian's "1:1.2.12.dfsg-1", RPM epoch strings, date-based versions).
+    Best-effort numeric tuple for version comparison. Handles plain semver
+    ("1.3.2", "v2.4.0", "3.3.1.1") and the common Debian/Ubuntu variants
+    ("1:1.2.12.dfsg-1", "1.2.11-1ubuntu2", "1.2.11+dfsg-1+deb10u2"). Returns
+    None on RPM epoch strings, date-based versions, or anything we can't
+    parse cleanly.
     """
-    v = normalize_version(v.strip())
-    # Reject epoch-prefixed (Debian) or dfsg-tagged versions; we can't compare those safely.
-    if ":" in v or "dfsg" in v.lower() or "~" in v:
-        return None
+    v = v.strip()
+    if DEBIAN_MARKER_RE.search(v):
+        # Debian-format: strip epoch, revision, and upstream metadata tags
+        # to leave the upstream version behind.
+        v = re.sub(r"^\d+:", "", v)                                              # epoch
+        v = re.sub(r"-[^-]*$", "", v)                                            # Debian revision
+        v = re.sub(r"[.+](?:dfsg|orig|ds|deb)\S*", "", v, flags=re.IGNORECASE)   # metadata suffixes
+    v = normalize_version(v)
     m = SEMVER_TUPLE_RE.match(v)
     if not m:
         return None
