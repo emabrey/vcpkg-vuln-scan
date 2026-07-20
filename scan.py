@@ -29,7 +29,7 @@ from typing import Iterable
 
 OSV_ENDPOINT = "https://api.osv.dev/v1/query"
 TOOL_NAME = "vcpkg-vuln-scan"
-TOOL_VERSION = "0.2.0"
+TOOL_VERSION = "0.3.0"
 TOOL_URI = "https://github.com/emabrey/vcpkg-vuln-scan"
 
 
@@ -42,6 +42,29 @@ def load_manifest(path: Path) -> list[str]:
         elif isinstance(d, dict) and "name" in d:
             names.append(d["name"])
     return names
+
+
+def locate_dep_line(manifest_text: str, name: str) -> int | None:
+    """
+    1-indexed line number where a dependency appears in vcpkg.json.
+    Handles both bare "name" strings and {"name": "name", ...} object forms.
+    Returns None if not found.
+    """
+    pat_object = re.compile(r'"name"\s*:\s*"' + re.escape(name) + r'"')
+    pat_bare = re.compile(r'^\s*"' + re.escape(name) + r'"\s*,?\s*$')
+    for i, line in enumerate(manifest_text.splitlines(), start=1):
+        if pat_object.search(line) or pat_bare.match(line):
+            return i
+    return None
+
+
+def locate_version_line(manifest_text: str) -> int | None:
+    """1-indexed line of the first version-ish key in a port manifest."""
+    pat = re.compile(r'"(?:version|version-semver|version-date|version-string)"\s*:')
+    for i, line in enumerate(manifest_text.splitlines(), start=1):
+        if pat.search(line):
+            return i
+    return None
 
 
 def port_version(vcpkg_root: Path, name: str) -> str | None:
@@ -247,7 +270,14 @@ def severity_bucket(score: float | None, vuln: dict) -> str:
     return "note"
 
 
-def build_sarif(findings: list[dict], manifest_uri: str) -> dict:
+def _physical_location(uri: str, line: int | None) -> dict:
+    loc = {"artifactLocation": {"uri": uri}}
+    if line is not None:
+        loc["region"] = {"startLine": line}
+    return loc
+
+
+def build_sarif(findings: list[dict]) -> dict:
     rules: dict[str, dict] = {}
     results: list[dict] = []
 
@@ -276,20 +306,34 @@ def build_sarif(findings: list[dict], manifest_uri: str) -> dict:
                 rule["properties"] = {"security-severity": str(cvss_score(v) or "")}
             rules[cid] = rule
 
-        results.append({
+        # Prefer the top-level manifest line when the dep is direct; fall back
+        # to the port manifest for transitive deps that only appear there.
+        primary_uri = f.get("primary_uri")
+        primary_line = f.get("primary_line")
+        related: list[dict] = []
+        port_uri = f.get("port_uri")
+        port_line = f.get("port_line")
+        if port_uri and port_uri != primary_uri:
+            related.append({
+                "physicalLocation": _physical_location(port_uri, port_line),
+                "message": {"text": f"{f['package']} port manifest"},
+            })
+
+        result = {
             "ruleId": cid,
             "level": severity_bucket(cvss_score(v), v),
             "message": {"text": f"{f['package']} {f['version'] or '(unknown version)'}: {summary or cid}"},
             "locations": [{
-                "physicalLocation": {
-                    "artifactLocation": {"uri": manifest_uri},
-                },
+                "physicalLocation": _physical_location(primary_uri or "vcpkg.json", primary_line),
                 "logicalLocations": [{"name": f["package"], "kind": "package"}],
             }],
             "partialFingerprints": {
                 "packageAndCve": f"{f['package']}@{f['version']}:{cid}",
             },
-        })
+        }
+        if related:
+            result["relatedLocations"] = related
+        results.append(result)
 
     return {
         "$schema": "https://json.schemastore.org/sarif-2.1.0.json",
@@ -352,6 +396,8 @@ def main() -> int:
     )
 
     top = load_manifest(manifest_path)
+    manifest_text = manifest_path.read_text(encoding="utf-8")
+    top_set = set(top)
     print(f"Top-level deps ({len(top)}): {', '.join(top)}\n")
 
     if args.transitive and vcpkg_root.exists():
@@ -368,6 +414,27 @@ def main() -> int:
 
     for name in closure:
         version = port_version(vcpkg_root, name) if vcpkg_root.exists() else None
+
+        # Locations for SARIF: manifest line for direct deps, port manifest for the version.
+        port_manifest_path = vcpkg_root / "ports" / name / "vcpkg.json"
+        port_uri: str | None = None
+        port_line: int | None = None
+        if port_manifest_path.exists():
+            port_uri = f"vcpkg/ports/{name}/vcpkg.json"
+            try:
+                port_line = locate_version_line(port_manifest_path.read_text(encoding="utf-8"))
+            except OSError:
+                port_line = None
+
+        if name in top_set:
+            primary_uri = "vcpkg.json"
+            primary_line = locate_dep_line(manifest_text, name)
+        elif port_uri:
+            primary_uri = port_uri
+            primary_line = port_line
+        else:
+            primary_uri = "vcpkg.json"
+            primary_line = None
 
         cached = cache.get(name, version)
         if cached is not None:
@@ -398,6 +465,10 @@ def main() -> int:
                     "version": version,
                     "canonical_id": cid,
                     "vuln": v,
+                    "primary_uri": primary_uri,
+                    "primary_line": primary_line,
+                    "port_uri": port_uri,
+                    "port_line": port_line,
                 })
 
         active_count = sum(1 for _, _, r in active if r is None)
@@ -433,7 +504,7 @@ def main() -> int:
         print(f"Wrote {args.json_out}")
 
     if args.sarif_out:
-        sarif = build_sarif(sarif_findings, manifest_uri="vcpkg.json")
+        sarif = build_sarif(sarif_findings)
         args.sarif_out.write_text(json.dumps(sarif, indent=2), encoding="utf-8")
         print(f"Wrote {args.sarif_out}")
 
