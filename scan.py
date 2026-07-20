@@ -29,7 +29,7 @@ from typing import Iterable
 
 OSV_ENDPOINT = "https://api.osv.dev/v1/query"
 TOOL_NAME = "vcpkg-vuln-scan"
-TOOL_VERSION = "0.5.0"
+TOOL_VERSION = "0.6.0"
 TOOL_URI = "https://github.com/emabrey/vcpkg-vuln-scan"
 
 
@@ -312,12 +312,58 @@ def parse_version_tuple(v: str) -> tuple[int, ...] | None:
     return parts if parts else None
 
 
+# Extracts a version from text like "before 2.8.2", "prior to v1.2.3", "< 4.0".
+FIX_TEXT_RE = re.compile(r"\b(?:before|prior to|<)\s*v?(\d+(?:\.\d+){1,3})\b", re.IGNORECASE)
+
+# Extracts a version from GitHub/GitLab release URLs. Handles v1.2.3, 1.2.3,
+# and expat-style R_2_8_2 tags.
+RELEASE_URL_RE = re.compile(
+    r"(?:github\.com|gitlab\.com)/[^/]+/[^/]+/"
+    r"(?:releases/tag|-/tags|tags)/"
+    r"(?:v|R_|release-|libtiff-|freetype-)?"
+    r"([\dvR._-]+)",
+    re.IGNORECASE,
+)
+
+
+def _extract_text_fixes(vuln: dict) -> list[tuple[int, ...]]:
+    """Find 'before X.Y.Z' style fix versions in the vuln's summary/details."""
+    text = " ".join([vuln.get("summary") or "", vuln.get("details") or ""])
+    out: list[tuple[int, ...]] = []
+    for m in FIX_TEXT_RE.finditer(text):
+        parsed = parse_version_tuple(m.group(1))
+        if parsed is not None:
+            out.append(parsed)
+    return out
+
+
+def _extract_url_fixes(vuln: dict) -> list[tuple[int, ...]]:
+    """Find fix versions in release-tag URLs from the vuln's references."""
+    out: list[tuple[int, ...]] = []
+    for ref in vuln.get("references", []) or []:
+        url = ref.get("url", "")
+        m = RELEASE_URL_RE.search(url)
+        if not m:
+            continue
+        # Expat uses R_2_8_2 style; normalise underscores to dots.
+        tag = m.group(1).replace("_", ".").lstrip(".")
+        parsed = parse_version_tuple(tag)
+        if parsed is not None:
+            out.append(parsed)
+    return out
+
+
 def likely_fixed(vuln: dict, current_version: str | None) -> bool:
     """
-    True when at least one 'affected' entry says a fix landed at a version
-    that's <= ours, and no 'introduced' event pushes past our version.
-    Only returns True when we can confidently compare. When in doubt we
-    keep the finding, so this errs toward false positives, not false negatives.
+    True when we can confidently determine that our version is at or past the
+    fix. Draws evidence from three places (any one sufficient):
+
+      1. Structured 'fixed' events in affected[].ranges[].events (OSV canonical).
+      2. 'before X.Y.Z' phrasing in the summary/details text (common on NVD).
+      3. Release-tag URLs in references[] (github/gitlab tag or release URLs).
+
+    Only returns True when at least one source parses cleanly and confirms
+    we're past the fix. When in doubt we keep the finding.
     """
     if not current_version:
         return False
@@ -341,9 +387,13 @@ def likely_fixed(vuln: dict, current_version: str | None) -> bool:
             if fixed is None:
                 continue
             if introduced is not None and ours < introduced:
-                continue  # we're before the vulnerable window
+                continue
             if ours >= fixed:
                 return True
+
+    for fix in _extract_text_fixes(vuln) + _extract_url_fixes(vuln):
+        if ours >= fix:
+            return True
     return False
 
 
