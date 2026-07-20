@@ -1,0 +1,8 @@
+{
+  "suppressions": [
+    {
+      "id": "CVE-2013-0340",
+      "reason": "libexpat XXE — application-level configuration, not applicable to our usage."
+    }
+  ]
+}

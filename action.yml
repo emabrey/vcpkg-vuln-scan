@@ -1,0 +1,97 @@
+name: 'vcpkg-vuln-scan'
+description: 'Scan a vcpkg-based project for known CVEs via OSV.dev'
+author: 'emabrey'
+branding:
+  icon: 'shield'
+  color: 'orange'
+
+inputs:
+  project-root:
+    description: 'Directory containing vcpkg.json'
+    required: false
+    default: '.'
+  transitive:
+    description: 'Walk transitive port dependencies'
+    required: false
+    default: 'false'
+  suppressions:
+    description: 'Path to a suppressions JSON file (see repo README)'
+    required: false
+    default: ''
+  sarif:
+    description: 'If set, write SARIF 2.1.0 to this path'
+    required: false
+    default: ''
+  json:
+    description: 'If set, write grouped JSON results to this path'
+    required: false
+    default: ''
+  fail-on-findings:
+    description: 'Fail the step when there are active findings'
+    required: false
+    default: 'true'
+  python-version:
+    description: 'Python version to install via actions/setup-python'
+    required: false
+    default: '3.11'
+  cache-ttl-hours:
+    description: 'OSV response cache TTL in hours'
+    required: false
+    default: '24'
+
+outputs:
+  sarif-path:
+    description: 'Path to the generated SARIF file (empty if none was requested)'
+    value: ${{ inputs.sarif }}
+  active-count:
+    description: 'Number of active (un-suppressed, non-withdrawn) findings'
+    value: ${{ steps.scan.outputs.active-count }}
+
+runs:
+  using: 'composite'
+  steps:
+    - name: Set up Python
+      uses: actions/setup-python@v5
+      with:
+        python-version: ${{ inputs.python-version }}
+
+    - name: Run vcpkg-vuln-scan
+      id: scan
+      shell: bash
+      env:
+        # Inputs come through as env vars so we don't have to escape them into the command line.
+        VVS_ROOT: ${{ inputs.project-root }}
+        VVS_TRANSITIVE: ${{ inputs.transitive }}
+        VVS_SUPPRESSIONS: ${{ inputs.suppressions }}
+        VVS_SARIF: ${{ inputs.sarif }}
+        VVS_JSON: ${{ inputs.json }}
+        VVS_FAIL: ${{ inputs.fail-on-findings }}
+        VVS_TTL: ${{ inputs.cache-ttl-hours }}
+      run: |
+        set -eo pipefail
+
+        args=( "$VVS_ROOT" --cache-ttl "$VVS_TTL" )
+        [ "$VVS_TRANSITIVE" = "true" ]      && args+=( --transitive )
+        [ -n "$VVS_SUPPRESSIONS" ]          && args+=( --suppressions "$VVS_SUPPRESSIONS" )
+        [ -n "$VVS_SARIF" ]                 && args+=( --sarif "$VVS_SARIF" )
+        [ -n "$VVS_JSON" ]                  && args+=( --json  "$VVS_JSON"  )
+
+        # scan.py sits next to this action.yml
+        script="${GITHUB_ACTION_PATH}/scan.py"
+
+        set +e
+        python "$script" "${args[@]}" | tee scan.log
+        code=${PIPESTATUS[0]}
+        set -e
+
+        active=$(grep -oE 'Summary: [0-9]+ active' scan.log | grep -oE '[0-9]+' || echo 0)
+        echo "active-count=${active}" >> "$GITHUB_OUTPUT"
+
+        if [ "$code" -eq 0 ]; then
+          exit 0
+        fi
+        if [ "$code" -eq 1 ] && [ "$VVS_FAIL" != "true" ]; then
+          echo "Findings present but fail-on-findings=false, treating as success."
+          exit 0
+        fi
+        exit "$code"
